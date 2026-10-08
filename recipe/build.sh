@@ -5,23 +5,66 @@ set -exuo pipefail
 # bun needs to be on the PATH for the scripts to work
 export PATH="$(pwd)/bun.native:${PATH}"
 
-export CMAKE_AR="$(which ${AR})"
+# The build scripts look up unprefixed LLVM tools (clang, clang++, llvm-ar, ...)
+# in $BUN_TOOLCHAIN_LLVM/bin. Point them at conda's compiler wrappers, which
+# already carry the target triple, sysroot and flags of the build environment.
+toolchain="${SRC_DIR}/conda-toolchain"
+mkdir -p "${toolchain}/bin"
+# bun's build ignores LDFLAGS, so add them to link invocations (e.g. to link
+# against libcxx/libstdcxx from $PREFIX instead of the system's).
+# rust's compiler activation pulls in gcc, which overrides CC, so use CLANG/CLANGXX.
+for wrapper in clang:"${CLANG:-${CC}}" clang++:"${CLANGXX:-${CXX}}"; do
+  cat > "${toolchain}/bin/${wrapper%%:*}" <<EOF
+#!/bin/bash
+for arg in "\$@"; do
+  case "\$arg" in
+    -c|-E|-S|-M|-MM|-print-*|--version) exec ${wrapper#*:} "\$@" ;;
+  esac
+done
+exec ${wrapper#*:} "\$@" ${LDFLAGS}
+EOF
+  chmod +x "${toolchain}/bin/${wrapper%%:*}"
+done
+if [[ "${target_platform}" == linux-* ]]; then
+  # GNU strip is looked up on PATH
+  ln -sf "$(command -v "${STRIP}")" "${toolchain}/bin/strip"
+fi
+for tool in llvm-ar llvm-ranlib llvm-nm llvm-strip dsymutil ld.lld; do
+  if [[ -x "${BUILD_PREFIX}/bin/${tool}" ]]; then
+    ln -sf "${BUILD_PREFIX}/bin/${tool}" "${toolchain}/bin/${tool}"
+  fi
+done
+export BUN_TOOLCHAIN_LLVM="${toolchain}"
+if [[ "${target_platform}" == linux-* ]]; then
+  # Compilers for build-time host tools and the Rust host linker (gcc's
+  # activation overrides CC_FOR_BUILD as well)
+  export CC_FOR_BUILD="${CONDA_TOOLCHAIN_BUILD}-clang"
+  export CXX_FOR_BUILD="${CONDA_TOOLCHAIN_BUILD}-clang++"
+fi
+export PATH="${toolchain}/bin:${PATH}"
+
+# Use conda-forge's stable Rust; bun's build relies on nightly-only flags.
+export BUN_TOOLCHAIN_RUST="${BUILD_PREFIX}"
+export RUSTC_BOOTSTRAP=1
+
+# GIT_SHA (set in recipe.yaml) is the build revision; these would take precedence
+unset CI BUILDKITE_COMMIT GITHUB_SHA
+
+build_args=(
+  --profile=release
+  --canary=off
+  --build-dir=build/release
+  --cache-dir="${SRC_DIR}/.bun-cache"
+  --static-libatomic=off
+)
 if [[ "${target_platform}" == osx-* ]]; then
-  export CXXFLAGS="${CXXFLAGS} -D_LIBCPP_DISABLE_AVAILABILITY"
-  export CMAKE_ARGS="${CMAKE_ARGS} -DCMAKE_DSYMUTIL=$(which ${HOST}-dsymutil)"
-  export CMAKE_LLD="$(which lld)"
-  export CMAKE_STRIP="$BUILD_PREFIX/bin/llvm-strip"
-else
-  export CMAKE_LLD="$(which ld.lld)"
-  export CMAKE_STRIP="$(which ${STRIP})"
+  build_args+=(--osx-deployment-target="${MACOSX_DEPLOYMENT_TARGET}")
+fi
+if [[ "${target_platform}" == "linux-aarch64" ]]; then
+  build_args+=(--os=linux --arch=aarch64 --abi=gnu)
 fi
 
-export CMAKE_ARGS="$CMAKE_ARGS -DCMAKE_AR=${CMAKE_AR} -DCMAKE_STRIP=${CMAKE_STRIP} -DUSE_STATIC_SQLITE=OFF -DUSE_STATIC_LIBATOMIC=OFF"
-
-# Invalid environment variable: CI="azure", please use CI=<ON|OFF>
-unset CI
-
-bun ./scripts/build.mjs -GNinja -DCMAKE_BUILD_TYPE=Release ${CMAKE_ARGS} -B build/release
+bun ./scripts/build.ts "${build_args[@]}"
 
 mkdir -p $PREFIX/bin
 cp build/release/bun $PREFIX/bin/bun
@@ -45,3 +88,15 @@ grep -q '_file_arguments()' $PREFIX/share/bash-completion/completions/bun
 mkdir -p $PREFIX/share/fish/vendor_completions.d
 SHELL=fish "$completion_bun" completions > $PREFIX/share/fish/vendor_completions.d/bun.fish
 grep -q '__fish__get_bun_bins' $PREFIX/share/fish/vendor_completions.d/bun.fish
+
+# licenses
+cargo-bundle-licenses --format yaml --output THIRDPARTY.yml
+mkdir -p vendored-licenses
+for dep in vendor/*/; do
+  dep_name="$(basename "${dep}")"
+  for license in "${dep}"{LICENSE,LICENCE,COPYING,NOTICE}*; do
+    if [[ -f "${license}" ]]; then
+      cp "${license}" "vendored-licenses/${dep_name}-$(basename "${license}")"
+    fi
+  done
+done
